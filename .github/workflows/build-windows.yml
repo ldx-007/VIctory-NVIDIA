@@ -1,0 +1,36 @@
+name: Build VIctory-NVIDIA for Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # The diagnostics build is the one every number in README.md is of, and
+      # the ray-tracing skip list (VICTORY_SKIP_PIPELINES, rt_off_hashes.txt)
+      # is a diagnostics switch, so the release build cannot skip those passes.
+      # scripts\play-nvidia.ps1 looks for target\diag\victory.exe by name.
+      - run: cargo build --locked --profile diag -p victory --features diagnostics
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-windows-x64-diag
+          path: target/diag/victory.exe
+          if-no-files-found: error
+
+      # A plain release build as well: faster, and it keeps DRED, the debug
+      # layer and the frame recorder out. A failure here costs only this file.
+      - continue-on-error: true
+        run: cargo build --locked --release -p victory
+      - continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-windows-x64
+          path: target/release/victory.exe
+          if-no-files-found: error
