@@ -703,8 +703,14 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    tracing::warn!(
+                        error = %e,
+                        program = code_bytes(&code(0)).len(),
+                        ?shaders,
+                        "host pipeline refused"
+                    );
                     host.log_messages();
+                    dump_refused(1, |stage| code(stage));
                     return None;
                 }
             };
@@ -758,6 +764,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
+                    dump_refused(2, |stage| code(stage));
                     return None;
                 }
             };
@@ -864,6 +871,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
+                dump_refused(2, |stage| code(stage));
                 return None;
             }
         };
@@ -1083,6 +1091,46 @@ fn mesh_pipeline(
     } else {
         build(Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth))
     }
+}
+
+/// Pipelines the host has refused, for the file names of [`dump_refused`].
+static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_DUMP_PIPELINES=<folder>`: the translated programs of a pipeline
+/// the host refused, as `<folder>/refused-<n>-<stage>.dxil`, `n` being the number
+/// logged with them. A container the driver will not take says why in its own
+/// chunks: read the files with a DXBC reader, or disassemble them.
+fn dump_refused(count: usize, code: impl Fn(usize) -> D3D12_SHADER_BYTECODE) {
+    let Some(folder) = std::env::var_os("VICTORY_DUMP_PIPELINES").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let n = REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::fs::create_dir_all(&folder).is_err() {
+        tracing::warn!(folder = ?folder, "the refused pipelines cannot be written here");
+        return;
+    }
+    let mut programs = 0;
+    for stage in 0..count {
+        let at = code(stage);
+        if at.pShaderBytecode.is_null() || at.BytecodeLength == 0 {
+            continue;
+        }
+        // SAFETY: a translation's own bytes, alive while its shader is.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(at.pShaderBytecode.cast::<u8>(), at.BytecodeLength) };
+        let file = folder.join(format!("refused-{n}-{stage}.dxil"));
+        if let Err(e) = std::fs::write(&file, bytes) {
+            tracing::warn!(error = %e, file = ?file, "a refused pipeline's program was not written");
+        } else {
+            programs += 1;
+        }
+    }
+    tracing::warn!(
+        number = n,
+        folder = ?folder,
+        programs,
+        "a refused pipeline's programs were written (VICTORY_DUMP_PIPELINES)"
+    );
 }
 
 /// The bytes of shader code (none for an absent stage).

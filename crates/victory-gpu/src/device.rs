@@ -359,7 +359,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -388,9 +388,14 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // The interface the title wants the object back as, its sixteen bytes
+        // in the order of an Iid: the PC's ID3D12PipelineState, or something
+        // the console has of its own, decides what these two methods are.
+        let interface = words(iid as usize).map(|w| [w[0], w[1]]);
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
+            interface = format_args!("{interface:x?}"),
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"

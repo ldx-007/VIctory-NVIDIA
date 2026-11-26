@@ -4219,8 +4219,9 @@ fn make_twinned(
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view has no host resource (null: writes through it are lost): resource {resource:?}, view {:?}",
-                        &desc[..10]
+                        "placed unordered texture view has no host resource (null: writes through it are lost): \
+                         resource {resource:?}, view {:?} (words 10 and 11 the memory, 12 to 15 the console's own)",
+                        &desc[..]
                     );
                 }
                 return None;
