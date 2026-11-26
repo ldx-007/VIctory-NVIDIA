@@ -4203,12 +4203,13 @@ fn make_twinned(
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
-                // shortcut: unordered access to a texture the title placed
-                // itself is not mirrored; give it a resource as shader
-                // views of such textures get when a dispatch writes one.
-                // Each texture is said once (the first 64), with how many times
-                // such a view was asked for so far: what shaders write through
-                // them is lost.
+                // A texture the title placed in memory, asked for with
+                // unordered access, with no host resource to write through:
+                // `crate::resource::uav_texture_at` refused it (a format the
+                // host will not let be written) or `VICTORY_PLACED_UAV=0`
+                // turned it off. Each texture is said once (the first 64),
+                // with how many times such a view was asked for so far: what
+                // shaders write through this slot is lost.
                 static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
                 static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -4218,7 +4219,7 @@ fn make_twinned(
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
+                        "placed unordered texture view has no host resource (null: writes through it are lost): resource {resource:?}, view {:?}",
                         &desc[..10]
                     );
                 }
@@ -4532,20 +4533,41 @@ fn same_placed_texture(a: &View, b: &View) -> bool {
     }
 }
 
-/// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
+/// A shader or unordered access view of a texture the title placed in
+/// memory itself, as a view of the resource made for that memory (on first
+/// use). Reading gets [`texture_at`]'s copy of the memory; writing gets one
+/// the host may write through (`crate::resource::uav_texture_at`), which the
+/// shader views of the same memory then read back through
+/// `crate::resource::alias_of`. `VICTORY_PLACED_UAV=0` leaves the old null
+/// view where a write was asked for.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
-    let View::Placed(false, resource, desc) = view else {
+    let View::Placed(unordered, resource, desc) = view else {
         return None;
     };
     if resource[0] == BUFFER {
         return None;
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+    let words: Option<[u32; 10]> = desc[..10].try_into().ok();
+    if *unordered {
+        if !placed_uav() {
+            return None;
+        }
+        let texture = crate::resource::uav_texture_at(address, resource, desc[0])?;
+        // No counter resource: what the title places in memory has none.
+        return Some(View::Unordered(texture as usize, 0, words));
+    }
     let texture = crate::resource::texture_at(address, resource)?;
     crate::resource::want_level(texture, crate::resource::first_mip(desc));
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    Some(View::Shader(texture as usize, words))
+}
+
+/// Whether a write through a view of a texture the title placed in memory
+/// gets a host resource of its own; `VICTORY_PLACED_UAV=0` turns that off.
+fn placed_uav() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_UAV").is_none_or(|v| v != "0"))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host

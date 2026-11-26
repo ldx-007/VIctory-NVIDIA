@@ -3079,6 +3079,158 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     Some(out)
 }
 
+/// The resource for an unordered access view of a texture placed at
+/// `address` with resource description `desc` and view format `view_format`
+/// (0: the resource's own): a texture the host may write through, at that
+/// address: the one it has there already when its format allows the view,
+/// else one made on first use with the unordered access flag the host
+/// requires of a texture written through a view of it.
+///
+/// [`texture_at`]'s copy of the same memory cannot take those writes: it is
+/// made as the title described the texture, and the title describes these
+/// without that flag, so `CreateUnorderedAccessView` is refused on it. What
+/// is made here is recorded in [`TARGETS_AT`] (by [`hand_out_resource`],
+/// which does it for every texture nothing fills from memory), so the shader
+/// views the title places at `address` find what a dispatch wrote through
+/// [`alias_of`].
+#[cfg(windows)]
+pub(crate) fn uav_texture_at(
+    address: u64,
+    desc: &[u32; 14],
+    view_format: u32,
+) -> Option<This> {
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    const UNORDERED_ACCESS: u32 = 0x8;
+    const DEFAULT: HeapProperties = HeapProperties {
+        kind: 1,
+        cpu_pages: 0,
+        pool: 0,
+        creation_nodes: 1,
+        visible_nodes: 1,
+    };
+    if address == 0 {
+        return None;
+    }
+    // Words 1 and 13 are the description's filler (`texture_at`): a key with
+    // them in would make one writable resource per stack bytes.
+    let mut key = *desc;
+    if std::env::var_os("VICTORY_PLACED_FILLER").is_none_or(|v| v != "1") {
+        key[1] = 0;
+        key[13] = 0;
+    }
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { key.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    if d.dimension == BUFFER {
+        return None;
+    }
+    let own = pc_format(d.format);
+    let wanted = if view_format == 0 { own } else { pc_format(view_format) };
+    // A texture at this address the host may already write through, of the
+    // same shape and of a format the view fits: write through that one.
+    {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&other) = targets.get(&address) {
+            let o = resource(other as This);
+            let o_fmt = target_format(pc_format(o.desc.format));
+            let w_fmt = target_format(wanted);
+            let typeless = family(o_fmt) == o_fmt && family(o_fmt + 1) == o_fmt;
+            let srgb = SRGB.iter().any(|&(s, _)| s == o_fmt);
+            let allows = o_fmt == w_fmt || ((typeless || srgb) && family(w_fmt) == family(o_fmt));
+            if o.desc.dimension == d.dimension
+                && o.desc.width == d.width
+                && o.desc.height == d.height
+                && o.desc.mip_levels == d.mip_levels
+                && o.desc.depth_or_array_size == d.depth_or_array_size
+                && o.desc.sample_count <= 1
+                && d.sample_count <= 1
+                && o.desc.flags & (DEPTH | UNORDERED) == UNORDERED
+                && allows
+            {
+                return Some(other as This);
+            }
+        }
+    }
+    // The host's own: unordered access, never the depth flag (the host gives
+    // a depth texture no unordered access view, and `View::Unordered` looks
+    // for its colour twin), and of the view's family when the view's format
+    // is of the same family in another kind.
+    let mut r = key;
+    r[12] = (r[12] & !DEPTH) | UNORDERED;
+    if view_format != 0 && target_format(own) != target_format(wanted) {
+        if family(own) == family(wanted) {
+            r[8] = family(wanted);
+        } else if element(own) == element(wanted) {
+            r[8] = wanted;
+        }
+    }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&known) = map.get(&(address, r)) {
+        // A target of its own may have taken the table's place and gone
+        // since: take the place back when nothing holds it now.
+        TARGETS_AT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(address)
+            .or_insert(known);
+        return Some(known as This);
+    }
+    drop(map);
+    // SAFETY: 56 bytes in the description's layout.
+    let uav = unsafe { r.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    let mut out = std::ptr::null();
+    let made = hand_out_resource(
+        uav,
+        DEFAULT,
+        0,
+        Backing::Address(address as *mut u8),
+        UNORDERED_ACCESS,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        &mut out,
+    );
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if made != S_OK {
+        // A format the host will not let be written: the slot stays null, as
+        // it was, and what a draw wrote through it is still lost.
+        if said < 8 {
+            tracing::warn!(
+                address = format_args!("{address:#x}"),
+                error = ?made,
+                view = view_format,
+                desc = ?r,
+                "a host texture to write through a view the title placed was refused"
+            );
+        }
+        return None;
+    }
+    // Said for the first few: from here on, what the title's own compute
+    // wrote through these views exists on the host.
+    if said < 16 {
+        tracing::info!(
+            address = format_args!("{address:#x}"),
+            dimension = d.dimension,
+            width = d.width,
+            height = d.height,
+            mips = d.mip_levels,
+            layers = d.depth_or_array_size,
+            format = d.format,
+            view = view_format,
+            "a host texture to write through a view the title placed"
+        );
+    }
+    PLACED_TEXTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((address, r), out as usize);
+    resource(out)
+        .host
+        .placed
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Some(out)
+}
+
 pub(crate) extern "system" fn create_placed(
     _: This,
     heap: This,
