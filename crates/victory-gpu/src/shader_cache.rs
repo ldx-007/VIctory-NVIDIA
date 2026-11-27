@@ -63,16 +63,12 @@ fn build() -> [u8; 32] {
         // served the translations an earlier run of the same
         // executable had cached with the switch unset.
         for name in [
-            "VICTORY_BVH_MISS",
-            // LOCAL: colours and image stores with NaN made 0.
-            "VICTORY_NAN_SCRUB",
-            // LOCAL (fxceless #1216): constant buffer slots marked.
-            "VICTORY_CONSTANT_MARKS",
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_FILTER_3D",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",
@@ -80,12 +76,23 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_THREAD_TICKET",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
+            bytes.push(0);
+        }
+        // So is whether pixel programs keep the console's early depth test
+        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
+        // translations cached without it are still served without it.
+        if victory_shader::emit::early_depth() {
+            tracing::info!(
+                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+            );
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.
@@ -121,51 +128,10 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    let shader = match CACHE.get() {
+    match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
-    }?;
-    #[cfg(feature = "diagnostics")]
-    let shader = paired_override(container, shader);
-    Ok(shader)
-}
-
-/// Try cache entries made by the paired-wave translator for the 32-lane,
-/// one-million-descriptor host. The normal translation remains our source
-/// of binding metadata and remains in the translation cache.
-#[cfg(feature = "diagnostics")]
-fn paired_override(container: &[u8], mut shader: HostShader) -> HostShader {
-    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_PAIRED_SHADER_DIR").map(PathBuf::from)) else {
-        return shader;
-    };
-    if shader.stage != HwStage::Cs || victory_shader::emit::host_settings() != [32, 999_999, 0, 0] {
-        return shader;
     }
-    let digest = blake3::hash(container).to_hex();
-    let hash = &digest[..16];
-    let path = dir.join(format!("{hash}.vsh"));
-    let mut bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return shader,
-        Err(e) => {
-            tracing::warn!(hash, error = %e, "could not read paired shader");
-            return shader;
-        }
-    };
-    // Paired VSH1 entries predate the half-view list. These programs have
-    // none. The equality check includes the list on our side.
-    bytes.extend_from_slice(&0u32.to_le_bytes());
-    if let Some(mut paired) = decode(&bytes) {
-        let dxil = std::mem::replace(&mut paired.dxil, shader.dxil.clone());
-        if paired == shader && dxil.starts_with(b"DXBC") {
-            shader.dxil = dxil;
-            tracing::info!(hash, "using paired Wave32 bytecode with matching shader bindings");
-            return shader;
-        }
-    }
-    tracing::warn!(hash, "paired shader entry did not match the translated shader bindings");
-    shader
 }
 
 /// The cache entry's converter: the build and the container in, the
@@ -313,11 +279,6 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
-    word(&mut out, s.half_views.len() as u32);
-    for &(slot, dword) in &s.half_views {
-        word(&mut out, u32::from(slot));
-        word(&mut out, dword);
-    }
     out
 }
 
@@ -386,11 +347,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
-    let n = r.word()? as usize;
-    let mut half_views = Vec::with_capacity(n.min(256));
-    for _ in 0..n {
-        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
-    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -401,7 +357,6 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
-        half_views,
     })
 }
 
@@ -436,7 +391,6 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
-            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

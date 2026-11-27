@@ -33,23 +33,25 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod heap_marks;
+#[cfg(windows)]
 mod host;
-
-/// LOCAL (11/26): the F1 settings menu is shown (host/menu.rs): the title gets no keyboard.
+/// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
+/// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(windows)]
-pub mod streamline;
-#[cfg(windows)]
-mod fg;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod port;
 #[cfg(windows)]
 mod land;
 pub mod list;
@@ -72,10 +74,6 @@ mod residency;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
-mod stretch;
-#[cfg(all(windows, feature = "dlss"))]
-mod dlss;
-#[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]
 mod sampler;
@@ -88,6 +86,8 @@ mod shadow;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
 mod switch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod ab;
@@ -120,11 +120,18 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
+pub use shadow::title_memory_write_combined;
+#[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
-    writing as kernel_will_write,
+    SoftViews, kernel_writing, soft_view_guards, title_memory_allocated, title_memory_freed, title_memory_made_real,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };

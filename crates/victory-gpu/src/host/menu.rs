@@ -1,20 +1,23 @@
-//! LOCAL (11/26): the F1 settings menu. F1 shows and hides it while our
-//! window has the focus; Up/Down pick a setting, Left/Right change it, Enter
-//! runs the line picked (save, save and restart, reset, close), Esc closes.
-//! While it is shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`,
-//! read by the input module); a pad still works.
+//! The F1 settings menu. F1 shows and hides it while our window has the
+//! focus; Up/Down pick a setting, Left/Right change it, Enter runs the line
+//! picked (save, save and restart, reset, close), Esc closes. While it is
+//! shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the
+//! input module); a pad still works.
 //!
-//! Most settings are read once at start, so a change is saved to the file
-//! `VICTORY_MENU_FILE` names (play.ps1 sets it to the play folder's
-//! settings.txt and applies it at every start) and takes effect at the next
-//! start; "SAVE AND RESTART" starts play.ps1 again (`VICTORY_MENU_PLAY`,
-//! with `VICTORY_MENU_ARGS`) and ends this run. Lines marked LIVE change at
-//! once.
+//! The settings are read once at start, so a change is saved to the file
+//! `VICTORY_MENU_FILE` names (`scripts\play-foxhound.ps1` sets it to
+//! `victory-settings.txt` in the repository's folder and applies it at every
+//! start) and takes effect at the next start; "SAVE AND RESTART" starts the
+//! launcher again (`VICTORY_MENU_PLAY`, with `VICTORY_MENU_ARGS`) and ends
+//! this run. The `VICTORY_MENU_...` settings are the launcher's own choices
+//! (DLSS mode, frame generation, frame rate, console, picture size), which it
+//! turns into the layer's switches; the others are the switches themselves.
 //!
-//! Drawn as the stats panel is (`super::panel`): white text on a black box,
-//! copied onto the swap chain's buffer, in the middle of the picture.
+//! In every build, as the stats panel is. Drawn as
+//! that panel is: white text on a black box, copied onto the swap chain's
+//! buffer, in the middle of the picture.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -25,7 +28,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::panel::{colours, glyph};
+use super::font::{colours, glyph};
 use super::{Host, HostList, transition};
 
 const GLYPH: (u32, u32) = (5, 7);
@@ -47,51 +50,42 @@ struct Item {
     live: bool,
 }
 
-const OFF_ON: &[(&str, &str)] = &[("0", "OFF"), ("1", "ON")];
+const ON_UNSET: &[(&str, &str)] = &[("1", "ON"), ("", "OFF")];
 const UNSET_ON: &[(&str, &str)] = &[("", "OFF"), ("1", "ON")];
+const STAGES: &[(&str, &str)] = &[("2", "2"), ("1", "1"), ("0", "0 OFF")];
 
+/// The first value of each is what the launcher starts with.
 #[rustfmt::skip]
 const ITEMS: &[Item] = &[
-    Item { var: "VICTORY_UPSCALE", label: "UPSCALER", values: &[("dlss", "DLSS"), ("stretch", "STRETCH"), ("", "GAME FSR4 (SLOW)")], live: false },
-    Item { var: "VICTORY_FRAME_GEN", label: "FRAME GEN (NOT WITH RAY TR.)", values: &[("", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
-    Item { var: "VICTORY_FPS_CAP", label: "FRAME RATE CAP", values: &[("", "GAME (30)"), ("60", "60"), ("120", "120"), ("0", "NONE")], live: true },
-    Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (REAL LIGHTING)", values: &[("", "OFF"), ("1", "ON")], live: false },
-    Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT (K)"), ("K", "K TRANSFORMER"), ("J", "J TRANSFORMER"), ("M", "M TRANSFORMER"), ("L", "L TRANSFORMER")], live: false },
-    Item { var: "VICTORY_DLSS_SHARPNESS", label: "DLSS SHARPNESS", values: &[("0", "0"), ("0.25", "0.25"), ("0.5", "0.5"), ("0.75", "0.75"), ("1", "1")], live: true },
-    Item { var: "VICTORY_MENU_SMOOTH_MOTION", label: "SMOOTH MOTION", values: &[("1", "ON"), ("0", "OFF")], live: false },
-    Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-s", "SERIES S"), ("series-x", "SERIES X")], live: false },
-    Item { var: "VICTORY_ADAPTER", label: "GRAPHICS CARD", values: &[("", "WINDOWS DEFAULT"), ("#0", "CARD 0"), ("#1", "CARD 1"), ("#2", "CARD 2")], live: false },
-    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: UNSET_ON, live: true },
-    Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: &[("2", "2"), ("1", "1"), ("0", "0 OFF")], live: false },
-    Item { var: "VICTORY_RELAY_COPY", label: "RELAY COPY QUEUE", values: OFF_ON, live: false },
-    Item { var: "VICTORY_FETCH_CHECK", label: "FETCH CHECK", values: OFF_ON, live: false },
-    Item { var: "VICTORY_WIDE_BACK", label: "WIDE COPY BACK", values: OFF_ON, live: false },
-    Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: &[("2", "2"), ("1", "1"), ("0", "0 OFF")], live: false },
-    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: OFF_ON, live: false },
-    Item { var: "VICTORY_HEAP_RECHECK_EVERY", label: "TEXTURE RECHECK (OIL TEST)", values: &[("", "OFF"), ("60", "EVERY 60 FRAMES"), ("15", "EVERY 15 FRAMES")], live: false },
-    Item { var: "VICTORY_NULL_SAMPLER_LINEAR", label: "LINEAR STAND-IN SAMPLER", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_AMBIENT", label: "AMBIENT STAND-IN", values: OFF_ON, live: false },
+    // The launcher's own choices.
+    Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
+    Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
+    Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
+    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
+    Item { var: "VICTORY_FULLSCREEN", label: "FULLSCREEN (NO BORDER)", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
+    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+    // The layer's switches.
+    Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
+    Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
+    Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
-    Item { var: "VICTORY_NAN_SCRUB", label: "NAN SCRUB (SHADERS REBUILD)", values: OFF_ON, live: false },
-    Item { var: "VICTORY_THIN", label: "THIN", values: OFF_ON, live: false },
-    Item { var: "VICTORY_JOIN_PARTS", label: "JOIN PARTS", values: &[("8", "8"), ("4", "4"), ("16", "16"), ("1", "1")], live: false },
-    Item { var: "VICTORY_JOIN_COPIES", label: "JOIN COPIES", values: OFF_ON, live: false },
-    Item { var: "VICTORY_UPLOAD_AHEAD", label: "UPLOAD AHEAD", values: OFF_ON, live: false },
-    Item { var: "VICTORY_INDIRECT_WINDOW", label: "INDIRECT WINDOW", values: OFF_ON, live: false },
-    Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: &[("2", "2"), ("1", "1"), ("0", "0 OFF")], live: false },
-    Item { var: "VICTORY_CARD_REHASH_RUNS", label: "CARD REHASH RUNS", values: OFF_ON, live: false },
-    Item { var: "VICTORY_MAP_THREADS", label: "MAP THREADS", values: OFF_ON, live: false },
-    Item { var: "VICTORY_TITLE_PRIORITIES", label: "TITLE THREAD PRIORITIES", values: OFF_ON, live: false },
-    Item { var: "VICTORY_CARD_AWAKE", label: "KEEP CARD AWAKE", values: OFF_ON, live: false },
-    Item { var: "VICTORY_SHOW_AFTER", label: "SHOW AFTER", values: OFF_ON, live: false },
-    Item { var: "VICTORY_PIPELINE_WAIT_MS", label: "SHADER WAIT MS", values: &[("10000", "10000"), ("30000", "30000"), ("1000", "1000"), ("0", "0 SKIP")], live: false },
-    Item { var: "VICTORY_DYNAMIC_SLOTS", label: "DESCRIPTOR SLOTS", values: &[("524288", "524288"), ("262144", "262144"), ("1000000", "1000000")], live: false },
-    Item { var: "VICTORY_CARD_BUFFERS_MB", label: "CARD BUFFERS MB", values: &[("1536", "1536"), ("1024", "1024"), ("2048", "2048"), ("512", "512"), ("0", "0 OFF")], live: false },
-    Item { var: "VICTORY_RENDER_SCALE", label: "RENDER SCALE", values: &[("", "GAME (720P)"), ("0.5", "0.5 (540P)"), ("0.75", "0.75")], live: false },
-    Item { var: "VICTORY_OWN_UPSCALER", label: "OWN UPSCALER", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_D3D12_DRED", label: "CRASH BREADCRUMBS", values: &[("light", "LIGHT"), ("", "OFF")], live: false },
+    Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
+    Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
+    Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_SOFT_VIEWS", label: "SOFT VIEWS (NO CUT FREEZES)", values: &[("copies", "ON"), ("", "OFF")], live: false },
+    Item { var: "VICTORY_TEXTURE_NO_WAIT", label: "TEXTURE NO WAIT", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_RELAY", label: "RELAY (SPEED, TRIANGLES)", values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_STEPS", label: "CARD STEPS", values: STAGES, live: false },
+    Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
+    Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
+    Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
 ];
-
 /// The lines after the settings.
 const ACTIONS: [&str; 4] = ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
 
@@ -99,9 +93,36 @@ fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
 }
 
-/// Whether a change of `item` shows at once.
+/// Whether a change of `item` shows at once. Frame generation does when this run started with
+/// it ready (the launcher asks for that whenever Streamline is there).
 fn live(item: &Item) -> bool {
-    item.live || (item.var == "VICTORY_FRAME_GEN" && crate::fg::active())
+    item.live || (item.var == "VICTORY_MENU_FRAMEGEN" && crate::streamline::framegen_live())
+}
+
+/// Whether the frame-rate line is shown at the top while the menu is closed
+/// (`VICTORY_FPS_LINE=0`: not; the menu changes it).
+fn fps_line_on() -> &'static AtomicBool {
+    static ON: OnceLock<AtomicBool> = OnceLock::new();
+    ON.get_or_init(|| AtomicBool::new(std::env::var_os("VICTORY_FPS_LINE").is_none_or(|v| v != "0")))
+}
+
+/// That line: the frames rendered a second and, while frame generation shows more, those shown.
+fn fps_line() -> Option<String> {
+    if !fps_line_on().load(Ordering::Relaxed) {
+        return None;
+    }
+    // The stats panel has that corner (F3), and says the same.
+    if super::panel::shown().load(Ordering::Relaxed) {
+        return None;
+    }
+    let fps = f64::from(super::METER_FPS_TENTHS.load(Ordering::Relaxed)) / 10.0;
+    if fps <= 0.0 {
+        return None;
+    }
+    Some(match crate::streamline::shown_per_frame() {
+        1 => format!("FPS: {fps:.1}"),
+        per => format!("FPS: {fps:.1}  FG: {:.1}", fps * f64::from(per)),
+    })
 }
 
 /// The index of `value` among the item's values (an unknown value: shown as
@@ -239,6 +260,8 @@ pub(super) struct Menu {
     at: usize,
     note: String,
     changed: bool,
+    /// What the buffer holds: the frame-rate line, or (none) the menu's lines.
+    painted: Option<String>,
     buffers: Option<Buffers>,
     failed: bool,
 }
@@ -247,8 +270,12 @@ impl Menu {
     pub(super) fn new() -> Menu {
         // Start the key thread now: F1 must be seen while the menu is closed.
         let _ = keys();
+        // `VICTORY_MENU_OPEN=1`: shown from the start (to look at it in a run nobody presses keys in).
+        if std::env::var_os("VICTORY_MENU_OPEN").is_some_and(|v| v == "1") {
+            crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
+        }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, buffers: None, failed: false }
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
     }
 
     fn open() -> bool {
@@ -296,8 +323,7 @@ impl Menu {
         self.note.clear();
     }
 
-    /// With a start that had frame generation on, its amount (and off) changes while running;
-    /// from a start without it, turning it on needs the restart (Streamline's swap chain).
+    /// A setting the build reads at each use: changed in this run's environment at once.
     fn apply_live(&self, i: usize) {
         let (var, value) = (ITEMS[i].var, &self.values[i]);
         // SAFETY: the variables changed here are read by this build with
@@ -310,18 +336,19 @@ impl Menu {
                 std::env::set_var(var, value);
             }
         }
-        if var == "VICTORY_FPS_CAP" {
-            crate::frame::set_cap(value);
-        }
-        if var == "VICTORY_PANEL" {
-            super::panel::shown().store(!value.is_empty(), Ordering::Relaxed);
+        match var {
+            // Off (0) or the frames shown for each one rendered, from the next present on.
+            "VICTORY_MENU_FRAMEGEN" => crate::streamline::set_framegen(value.parse().unwrap_or(0)),
+            "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
+            "VICTORY_PANEL" => super::panel::shown().store(value == "1", Ordering::Relaxed),
+            _ => {}
         }
     }
 
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
         let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = "NO SETTINGS FILE: START THE GAME WITH PLAY.PS1".to_owned();
+            self.note = "NO SETTINGS FILE: START WITH VICTORY PLAY".to_owned();
             return false;
         };
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
@@ -337,7 +364,7 @@ impl Menu {
             kept.retain(|(k, _)| k != item.var);
             kept.push((item.var.to_owned(), self.values[i].clone()));
         }
-        let mut text = String::from("# Saved by the F1 menu; play.ps1 applies these after its own settings (an empty value: unset).\r\n");
+        let mut text = String::from("# Saved by the F1 menu; applied over the play settings at every start (an empty value: unset).\r\n");
         for (k, v) in &kept {
             text.push_str(&format!("{k}={v}\r\n"));
         }
@@ -356,11 +383,11 @@ impl Menu {
         }
     }
 
-    /// Starts play.ps1 again in a new console, a few seconds on, and ends this run.
+    /// Starts the launcher again in a new console, a few seconds on, and ends this run.
     fn restart(&mut self) {
         use std::os::windows::process::CommandExt;
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
-            self.note = "SAVED. RESTART PLAY.PS1 YOURSELF".to_owned();
+            self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
             return;
         };
         let play = play.to_string_lossy().replace('\'', "''");
@@ -374,9 +401,8 @@ impl Menu {
         {
             Ok(_) => {
                 tracing::info!(command, "settings menu: restarting");
-                // Ended at once: std::process::exit runs the DLLs' unloading, and with Streamline
-                // loaded that never came back (11/26: a windowless leftover with one thread
-                // and 27 GB, which also kept the new build from being put in place).
+                // Ended at once: std::process::exit runs the DLLs' unloading, which with
+                // Streamline loaded did not come back (a windowless leftover process).
                 // SAFETY: this process, with nothing of its own left to save.
                 unsafe {
                     use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
@@ -391,7 +417,7 @@ impl Menu {
         }
     }
 
-    /// Empties the settings file: play.ps1's own settings at the next start.
+    /// Removes the settings file: the launcher's own settings at the next start.
     fn reset(&mut self) {
         if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
             let _ = std::fs::remove_file(path);
@@ -443,9 +469,17 @@ impl Menu {
 
     /// Records the copy of the box onto `back` (in the copy-destination state).
     pub(super) fn draw(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
-        if !Self::open() || self.failed {
+        if self.failed {
             return;
         }
+        // Closed: the frame-rate line in the top left corner, if it is wanted and there is a rate.
+        let open = Self::open();
+        let line = if open { None } else { fps_line() };
+        if !open && line.is_none() {
+            return;
+        }
+        // Our own copies are not part of a recorded frame (the recorder is in diagnostics builds).
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = (height / 540).max(1);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
@@ -454,15 +488,23 @@ impl Menu {
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
-        let lines = if self.changed { Some(self.lines()) } else { None };
+        if self.painted != line {
+            self.painted = line.clone();
+            self.changed = true;
+        }
+        let lines = if self.changed { Some(line.as_ref().map_or_else(|| self.lines(), |l| vec![l.clone()])) } else { None };
         let Some(buffers) = &mut self.buffers else { return };
         if let Some(lines) = lines {
             self.changed = false;
             buffers.write(&lines);
         }
-        let (w, h) = size(scale);
+        // The whole box in the middle, or of it the first line's part in the corner.
+        let (w, h) = match &line {
+            Some(l) => ((l.len() as u32 * CELL.0 + 2 * RIM) * scale, (CELL.1 + 2 * RIM) * scale),
+            None => size(scale),
+        };
         let (w, h) = (w.min(width), h.min(height));
-        let (x, y) = ((width - w) / 2, (height - h) / 2);
+        let (x, y) = if line.is_some() { (0, 0) } else { ((width - w) / 2, (height - h) / 2) };
         let list = &list.list;
         // SAFETY: an open list and live resources; the box lies within both.
         unsafe {
@@ -500,7 +542,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -515,7 +557,7 @@ mod tests {
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {

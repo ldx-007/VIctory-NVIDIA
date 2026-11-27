@@ -8,6 +8,12 @@
 //!
 //! shortcut: event offsets are ignored (every event is at the tick); tie
 //! the clock to presentation if a title paces by them.
+//!
+//! `VICTORY_FRAME_INTERVAL_MS=<ms>` ticks at that interval whatever the
+//! title sets (16.667: 60 a second; 0: no wait at all, every wait ends at
+//! once); unset, the title's interval as before. The loader gives the title
+//! the matching frame rate too (`victory_loader::frame_rate`), as the title
+//! would otherwise keep to its 30 with a limiter of its own.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
@@ -25,47 +31,30 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
-/// LOCAL (11/26): `VICTORY_FPS_CAP`. Unset: the title's own interval (30 frames a second on a
-/// Series S); `0`: none (ticks half a millisecond apart); `n`: n frames a second. The F1 menu
-/// changes it while running ([`set_cap`]). -1: not read yet; 0: the title's; else microseconds.
-static CAP_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
-
-fn parse_cap(value: Option<&str>) -> i64 {
-    match value.map(str::trim).and_then(|v| v.parse::<u32>().ok()) {
-        None => 0,
-        Some(0) => 500,
-        Some(n) => (1_000_000 / i64::from(n)).max(500),
-    }
+/// `VICTORY_FRAME_INTERVAL_MS`: the interval asked for in place of the
+/// title's (zero: no wait). Read once.
+fn asked() -> Option<Duration> {
+    static ASKED: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let spec = std::env::var("VICTORY_FRAME_INTERVAL_MS").ok()?;
+        let ms = parse_ms(&spec);
+        match ms {
+            Some(d) => tracing::info!(interval = ?d, "frame interval of ours in place of the title's (VICTORY_FRAME_INTERVAL_MS)"),
+            None => tracing::warn!(spec, "VICTORY_FRAME_INTERVAL_MS: expected milliseconds from 0 to 1000; the title's interval kept"),
+        }
+        ms
+    })
 }
 
-/// The interval ticks are apart: the title's, or the cap's when one is set.
-fn capped(asked: Duration) -> Duration {
-    let mut us = CAP_US.load(Ordering::Relaxed);
-    if us < 0 {
-        us = parse_cap(std::env::var("VICTORY_FPS_CAP").ok().as_deref());
-        CAP_US.store(us, Ordering::Relaxed);
-    }
-    if us == 0 { asked } else { Duration::from_micros(us as u64) }
-}
-
-/// The cap changed (the F1 menu): the clock goes on from now with the new interval.
-#[allow(dead_code)]
-pub(crate) fn set_cap(value: &str) {
-    CAP_US.store(parse_cap(Some(value).filter(|v| !v.is_empty())), Ordering::Relaxed);
-    let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
-    if let Some(c) = clock().as_mut() {
-        c.start = Instant::now();
-        c.first = first;
-        c.interval = capped(c.asked);
-        tracing::info!(asked = ?c.asked, interval = ?c.interval, "frame interval: the cap changed");
-    }
+/// `16.667` → 16,667 us; 0 → zero; negative, more than a second or not a
+/// number → `None`.
+fn parse_ms(spec: &str) -> Option<Duration> {
+    let ms = spec.trim().parse::<f64>().ok().filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))?;
+    Some(Duration::from_nanos((ms * 1e6).round() as u64))
 }
 
 struct Clock {
     start: Instant,
-    /// What the title asked for.
-    asked: Duration,
-    /// What ticks are apart ([`capped`]).
     interval: Duration,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
@@ -78,6 +67,25 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `VICTORY_FRAME_INTERVAL_US=<n>`: frames begin every `n` microseconds
+/// whatever interval the title sets (16667: 60 a second, 8333: 120, 1000:
+/// as fast as frames are made). The title sets 33,333 us (30 a second)
+/// against the 60 Hz mode it is offered; it times its own frames with the
+/// performance counter, so a shorter interval is a higher frame rate, not a
+/// faster game. Values outside 1,000..=1,000,000 are ignored.
+fn interval_override() -> Option<Duration> {
+    static OVERRIDE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let us = std::env::var("VICTORY_FRAME_INTERVAL_US").ok()?.trim().parse::<u64>().ok()?;
+        let interval = (1_000..=1_000_000).contains(&us).then(|| Duration::from_micros(us));
+        match interval {
+            Some(interval) => tracing::info!(?interval, "VICTORY_FRAME_INTERVAL_US: frame interval overridden"),
+            None => tracing::warn!(us, "VICTORY_FRAME_INTERVAL_US outside 1000..=1000000: ignored"),
+        }
+        interval
+    })
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -85,16 +93,17 @@ pub(crate) extern "system" fn set_interval(
     _: This,
     _output: This,
     length: u32,
-    _period: u32,
-    _flags: u32,
+    period: u32,
+    flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let asked_by_title = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    let asked = interval;
-    let interval = capped(asked);
-    tracing::info!(?asked, ?interval, "frame interval (VICTORY_FPS_CAP: unset the title's, 0 none, n frames a second)");
+    // VICTORY_FRAME_INTERVAL_MS (with the title's own rate patched to match)
+    // first, then VICTORY_FRAME_INTERVAL_US (our clock alone).
+    let interval = asked().or_else(interval_override).unwrap_or(asked_by_title);
+    tracing::info!(?interval, title = ?asked_by_title, period, flags, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -103,7 +112,6 @@ pub(crate) extern "system" fn set_interval(
         .unwrap_or(0);
     *clock() = Some(Clock {
         start: Instant::now(),
-        asked,
         interval,
         first,
     });
@@ -147,10 +155,14 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        asked: SIXTIETH,
-        interval: capped(SIXTIETH),
+        interval: asked().or_else(interval_override).unwrap_or(SIXTIETH),
         first: 0,
     });
+    if c.interval.is_zero() {
+        // No wait: every wait ends at once, on a tick of its own.
+        let tick = last(kind).load(Ordering::Relaxed) + 1;
+        return (tick, Duration::ZERO);
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =
@@ -196,7 +208,9 @@ pub(crate) extern "system" fn wait(
         std::thread::sleep(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
@@ -210,6 +224,7 @@ pub(crate) extern "system" fn wait(
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
         // Tokens count frames (consecutive), not ticks.
         let frame = FRAME.fetch_add(1, Ordering::Relaxed) + 1;
+        pace::begun();
         if !token.is_null() {
             // SAFETY: checked non-null; the title passes its token.
             unsafe { token.write(frame) };
@@ -227,6 +242,81 @@ pub(crate) extern "system" fn wait(
         "frame wait"
     );
     hr
+}
+
+/// How even the frames are (`VICTORY_TIMER_LOG=1`): the times between frame
+/// beginnings, logged every 5 s by bands, with the pairs of a short frame
+/// next to a long one (a 16/33 alternation shows as many of them).
+mod pace {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Upper edges of the bands, in milliseconds (the last band is open).
+    const BANDS: [f64; 6] = [12.0, 20.0, 28.0, 38.0, 55.0, 70.0];
+
+    struct Stats {
+        since: Instant,
+        last: Option<Instant>,
+        last_ms: f64,
+        bands: [u32; 7],
+        sum_ms: f64,
+        max_ms: f64,
+        n: u32,
+        alternations: u32,
+    }
+
+    static STATS: Mutex<Option<Stats>> = Mutex::new(None);
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_TIMER_LOG").is_ok_and(|v| v.trim() == "1"))
+    }
+
+    pub(super) fn begun() {
+        if !on() {
+            return;
+        }
+        let now = Instant::now();
+        let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let s = stats.get_or_insert_with(|| Stats {
+            since: now,
+            last: None,
+            last_ms: 0.0,
+            bands: [0; 7],
+            sum_ms: 0.0,
+            max_ms: 0.0,
+            n: 0,
+            alternations: 0,
+        });
+        if let Some(last) = s.last.replace(now) {
+            let ms = (now - last).as_secs_f64() * 1e3;
+            let band = BANDS.iter().position(|&edge| ms < edge).unwrap_or(BANDS.len());
+            s.bands[band] += 1;
+            s.sum_ms += ms;
+            s.max_ms = s.max_ms.max(ms);
+            if s.n > 0 && (ms < 20.0 && s.last_ms > 28.0 || ms > 28.0 && s.last_ms < 20.0) {
+                s.alternations += 1;
+            }
+            s.last_ms = ms;
+            s.n += 1;
+        }
+        if now - s.since >= Duration::from_secs(5) && s.n > 0 {
+            tracing::info!(
+                frames = s.n,
+                mean_ms = format_args!("{:.2}", s.sum_ms / f64::from(s.n)),
+                max_ms = format_args!("{:.1}", s.max_ms),
+                bands = ?s.bands,
+                alternations = s.alternations,
+                "frame pacing: times between frame beginnings (bands <12, <20, <28, <38, <55, <70, more ms)"
+            );
+            s.since = now;
+            s.bands = [0; 7];
+            s.sum_ms = 0.0;
+            s.max_ms = 0.0;
+            s.n = 0;
+            s.alternations = 0;
+        }
+    }
 }
 
 /// Device method: no statistics are kept, so none are returned.
@@ -247,6 +337,17 @@ pub(crate) extern "system" fn statistics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_reads_milliseconds() {
+        assert_eq!(parse_ms("16.667"), Some(Duration::from_micros(16_667)));
+        assert_eq!(parse_ms(" 8.333 "), Some(Duration::from_micros(8_333)));
+        assert_eq!(parse_ms("0"), Some(Duration::ZERO));
+        assert_eq!(parse_ms("-1"), None);
+        assert_eq!(parse_ms("1001"), None);
+        assert_eq!(parse_ms("NaN"), None);
+        assert_eq!(parse_ms("fast"), None);
+    }
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {

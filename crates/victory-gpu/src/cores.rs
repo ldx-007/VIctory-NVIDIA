@@ -69,8 +69,27 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// The priority our own threads that a frame waits for, and those they share
+/// their work with, run at (`VICTORY_HELPER_PRIORITY=<n>`, a thread priority
+/// from -2 to 2; not given: as made, normal, the submitting thread above
+/// normal). A frame's timeline in the first gameplay area (run timeline,
+/// 2026-11-26) had such threads woken and not running yet for 4-11 ms of its
+/// chain: the listing threads up to 5.4 ms at a time, while the title's own
+/// workers held every processor.
+fn helper_priority() -> Option<i32> {
+    static PRIORITY: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *PRIORITY.get_or_init(|| {
+        std::env::var("VICTORY_HELPER_PRIORITY").ok().and_then(|v| v.trim().parse::<i32>().ok()).map(|p| p.clamp(-2, 2))
+    })
+}
+
 fn ask(what: &str, from: u32) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, SetThreadSelectedCpuSets};
+    if let Some(priority) = helper_priority() {
+        // SAFETY: this thread's own priority.
+        let set = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
+        tracing::debug!(what, priority, set, "the thread's priority (VICTORY_HELPER_PRIORITY)");
+    }
     if stage() < from {
         return;
     }
@@ -89,6 +108,54 @@ fn ask(what: &str, from: u32) {
         tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread could not be kept on the fast cores");
     } else {
         tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+    }
+}
+
+/// Whether the threads the submitting thread waits for run at its priority
+/// (`VICTORY_HELPER_PRIORITY`, on unless `0`; `VICTORY_AB` can flip it while
+/// the title runs): above normal, ahead of the title's threads and of the
+/// threads that translate lists. They are the threads that spread its work
+/// (`shadow::wide`, the pools of `land`), the one that makes the heaps'
+/// records and the one that passes over the heap's views beside the lists.
+///
+/// On a processor with six cores (i5-12400F, 12 threads) the title's threads
+/// and eight translating lists kept every core busy, and the submitting
+/// thread (above normal since `queue::behind`) stood waiting for helpers at
+/// normal priority that were not running. Measured with `VICTORY_AB` in one
+/// run (run10, Series S at 540p, medians of 5-second windows in the world,
+/// off / on): 8.6 / 9.6 fps, refreshes 23.1 / 17.6 ms a frame, waiting for
+/// the heaps' records 6.2 / 2.5 ms, the card idle behind the submitting
+/// thread 24.7 / 13.2 ms. Lowering the translating threads below normal as
+/// well made each list call about 5 % slower, with no clear gain of its own.
+fn helpers_raised() -> bool {
+    crate::toggled!("VICTORY_HELPER_PRIORITY")
+}
+
+/// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
+/// each piece of work; it asks the system only when the switch has changed.
+pub(crate) struct Priority {
+    applied: Option<bool>,
+}
+
+impl Priority {
+    pub(crate) fn new() -> Self {
+        let mut priority = Self { applied: None };
+        priority.keep();
+        priority
+    }
+
+    pub(crate) fn keep(&mut self) {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL,
+        };
+        let on = helpers_raised();
+        if self.applied == Some(on) {
+            return;
+        }
+        let priority = if on { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL };
+        // SAFETY: our own thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        self.applied = Some(on);
     }
 }
 

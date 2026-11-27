@@ -15,6 +15,7 @@ mod host;
 mod image_watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::frame_phase;
+pub use victory_gpu::frames_begun;
 
 pub mod modules;
 mod registry;
@@ -23,6 +24,9 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+/// DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`).
+#[cfg(windows)]
+pub use victory_gpu::streamline;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
 
