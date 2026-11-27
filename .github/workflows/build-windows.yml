@@ -1,0 +1,117 @@
+# Builds the layer this fork's own launcher (scripts\play-nvidia.ps1) expects, so
+# a PC with no Rust toolchain can still play: download an artifact, unpack it into
+# <this checkout>\target\diag\ as victory.exe, keeping built-with.txt beside it.
+#
+# This branch is upstream main (github.com/trustno1-coder/VIctory-NVIDIA) plus this
+# one file, so the main branch stays exactly upstream.  To build: Actions /
+# "Build VIctory-NVIDIA for Windows" / Branch: codex/build-windows / Run workflow.
+# It takes a few minutes on a warm cache, longer on the very first run.
+#
+# Either artifact plays.  The difference is only the picture:
+#   nvidia-windows-x64-diag        without DLSS: the launcher stretches the game's
+#                                  720p picture to the screen instead
+#   nvidia-windows-x64-diag-dlss   with DLSS (720p to 1080p) and DLSS frame
+#                                  generation compiled in; built-with.txt beside
+#                                  the exe is how the launcher knows this build can
+#                                  do it, so unpack that file with the exe
+#
+# DLSS is only compiled in here.  The game also needs NVIDIA's nvngx_dlss.dll at
+# run time - about 70 MB with frame generation's files, which may not be
+# redistributed from here: run Get-NVIDIA-DLSS.cmd once in the checkout's folder on
+# the PC you play on, and the launcher finds them itself.
+# The DLSS job links NVIDIA's own nvsdk_ngx_d.lib under NVIDIA's licence; that
+# library is fetched into the runner and never uploaded, and what comes out of this
+# job is for your own machine, not for passing on.
+
+name: Build VIctory-NVIDIA for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  diag:
+    name: diag, with diagnostics
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      # The version and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag
+      - name: Build
+        run: cargo build --locked --profile diag -p victory --features diagnostics
+      - name: What made this
+        shell: pwsh
+        run: (cargo --version) + ' / ' + (rustc --version) | Set-Content -Encoding ascii target/diag/toolchain.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-windows-x64-diag
+          path: |
+            target/diag/victory.exe
+            target/diag/toolchain.txt
+            target/diag/*.pdb
+          if-no-files-found: error
+          retention-days: 30
+
+  diag-dlss:
+    name: diag, with diagnostics and DLSS
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: diag-dlss
+      # Only the loader library (4 MB) and NVIDIA's licence are needed to link; the
+      # runtime dll is the big one and is fetched on the PC that plays, by
+      # Get-NVIDIA-DLSS.cmd.  The tag is read from scripts/get-nvidia-sdks.ps1 so the
+      # two cannot drift apart.
+      - name: NVIDIA's DLSS loader library
+        shell: pwsh
+        run: |
+          $tag = Select-String -Path scripts/get-nvidia-sdks.ps1 -Pattern "DlssTag = '([^']+)'" |
+              ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if (-not $tag) { throw 'the DLSS tag is not where scripts/get-nvidia-sdks.ps1 keeps it' }
+          $sdk = Join-Path $PWD 'nvidia-sdk/DLSS'
+          foreach ($f in 'LICENSE.txt', 'lib/Windows_x86_64/x64/nvsdk_ngx_d.lib') {
+              $to = Join-Path $sdk $f
+              New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
+              Write-Host "  $f"
+              Invoke-WebRequest -Uri "https://raw.githubusercontent.com/NVIDIA/DLSS/$tag/$f" `
+                  -OutFile $to -UseBasicParsing -ErrorAction Stop
+          }
+          "VICTORY_DLSS_SDK=$sdk" | Add-Content -Path $env:GITHUB_ENV
+      - name: Build
+        run: cargo build --locked --profile diag -p victory --features diagnostics,dlss
+      # The launcher reads this file: a build nobody noted is taken at its word about
+      # DLSS, and one noted without it is not - so this is what keeps the launcher
+      # from asking a plain build to upscale through DLSS.
+      - name: Say what this build holds
+        shell: pwsh
+        run: Set-Content -Path target/diag/built-with.txt -Value 'diagnostics,dlss' -Encoding ascii
+      - name: What made this
+        shell: pwsh
+        run: (cargo --version) + ' / ' + (rustc --version) | Set-Content -Encoding ascii target/diag/toolchain.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nvidia-windows-x64-diag-dlss
+          path: |
+            target/diag/victory.exe
+            target/diag/built-with.txt
+            target/diag/toolchain.txt
+            target/diag/*.pdb
+          if-no-files-found: error
+          retention-days: 30
